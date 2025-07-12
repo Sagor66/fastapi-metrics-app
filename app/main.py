@@ -10,6 +10,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from prometheus_fastapi_instrumentator import Instrumentator
 from prometheus_client import Counter, Histogram
 from datetime import datetime
+import psutil
 
 
 app = FastAPI(title="FastAPI Metrics App")
@@ -91,14 +92,43 @@ def root():
     return {"Hello": "World", "status": "healthy"}
 
 # Health check with database status
-@app.get("/health")
+@app.get("/health", status_code=200)
 async def health_check():
-    db_status = "connected" if hasattr(app.state, 'pool') and app.state.pool else "disconnected"
-    return {
-        "status": "healthy",
-        "database": db_status,
-        "version": "1.0.0"
-    }
+    start_time = time.time()
+    try:
+        # Ensure DB pool is connected
+        if not getattr(app.state, "pool", None):
+            raise Exception("Database not connected")
+
+        async with app.state.pool.acquire() as conn:
+            result = await conn.fetchrow("SELECT NOW()")
+            db_time = result["now"].isoformat()
+
+        # Process memory info (similar to Node.js's process.memoryUsage())
+        process = psutil.Process(os.getpid())
+        memory_info = process.memory_info()._asdict()
+
+        return JSONResponse(
+            content={
+                "status": "healthy",
+                "timestamp": datetime.utcnow().isoformat(),
+                "database": "connected",
+                "uptime": round(time.time() - start_time, 2),
+                "memory": memory_info,
+                "db_time": db_time,
+            }
+        )
+
+    except Exception as error:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unhealthy",
+                "timestamp": datetime.utcnow().isoformat(),
+                "error": str(error),
+            }
+        )
+
 
 # Create user endpoint
 @app.post("/user", status_code=status.HTTP_201_CREATED)
