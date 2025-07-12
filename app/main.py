@@ -1,425 +1,344 @@
+# main.py  ── fully‑featured FastAPI + Prometheus service
 import os
 import time
+import asyncio
+import psutil
 import asyncpg
+from datetime import datetime
+
 from fastapi import FastAPI, Request, HTTPException, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from secure import Secure
-from fastapi.middleware.gzip import GZipMiddleware
+
 from prometheus_fastapi_instrumentator import Instrumentator
-from prometheus_client import Counter, Histogram
-from datetime import datetime
-import psutil
-
-
-app = FastAPI(title="FastAPI Metrics App")
-
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+from prometheus_client import (
+    Counter,
+    Histogram,
+    Gauge,
+    generate_latest,
+    CONTENT_TYPE_LATEST,
 )
 
-# Add Secure headers middleware
-secure_headers = Secure()
+# ────────────────────────────────────────────────────────────────────────────────
+#  FastAPI app & core middleware
+# ────────────────────────────────────────────────────────────────────────────────
+app = FastAPI(title="FastAPI Metrics App")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
+)
+app.add_middleware(GZipMiddleware, minimum_size=1_000)
+
+# Secure headers (equivalent to helmet in Express)
+secure_headers = Secure()
 class SecureMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
         secure_headers.framework.starlette(response)
         return response
-
 app.add_middleware(SecureMiddleware)
 
-# Add GZip compression
-app.add_middleware(GZipMiddleware, minimum_size=1000)
+# ────────────────────────────────────────────────────────────────────────────────
+#  Prometheus default instrumentation
+# ────────────────────────────────────────────────────────────────────────────────
+Instrumentator().instrument(app).expose(app)   # default /metrics endpoint
 
-# Add Prometheus metrics
-Instrumentator().instrument(app).expose(app)
-
-# Custom Prometheus metrics
-db_operations_total = Counter(
-    'db_operations_total',
-    'Total number of database operations',
-    ['operation', 'status']
+# ────────────────────────────────────────────────────────────────────────────────
+#  Custom Prometheus metrics  (parity with Node example)
+# ────────────────────────────────────────────────────────────────────────────────
+HTTP_REQUESTS_TOTAL = Counter(
+    "http_requests_total",
+    "Total number of HTTP requests",
+    ["method", "route", "status_code"],
+)
+HTTP_REQUEST_DURATION = Histogram(
+    "http_request_duration_seconds",
+    "Request latency in seconds",
+    ["method", "route", "status_code"],
+    buckets=[0.1, 0.3, 0.5, 0.7, 1, 3, 5, 7, 10],
 )
 
-db_query_duration = Histogram(
-    'db_query_duration_seconds',
-    'Time spent on database queries',
-    ['operation']
+DB_CONNECTIONS_ACTIVE = Gauge(
+    "db_connections_active",
+    "Number of active connections in asyncpg pool",
+)
+DB_QUERY_DURATION = Histogram(
+    "db_query_duration_seconds",
+    "Time spent on database queries",
+    ["operation"],
+    buckets=[0.01, 0.05, 0.1, 0.3, 0.5, 1, 2, 5],
+)
+DB_OPERATIONS_TOTAL = Counter(
+    "db_operations_total",
+    "Total number of database operations",
+    ["operation", "status"],
 )
 
-# Database config from env variables with fallbacks
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = int(os.getenv("DB_PORT", 5432))
-DB_NAME = os.getenv("DB_NAME", "appdb")
-DB_USER = os.getenv("DB_USER", "postgres")
+CPU_PERCENT_GAUGE = Gauge(
+    "process_cpu_percentage",
+    "CPU usage percentage of this Python process (sampled every 5 s)",
+)
+
+# ────────────────────────────────────────────────────────────────────────────────
+#  HTTP metrics middleware (mirrors Express custom middleware)
+# ────────────────────────────────────────────────────────────────────────────────
+@app.middleware("http")
+async def http_metrics_middleware(request: Request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+
+    # For FastAPI *routes* we can get route.path; fallback to raw URL path
+    route_path = request.scope.get("route").path if request.scope.get("route") else request.url.path
+
+    duration = time.time() - start_time
+    HTTP_REQUESTS_TOTAL.labels(
+        method=request.method, route=route_path, status_code=str(response.status_code)
+    ).inc()
+    HTTP_REQUEST_DURATION.labels(
+        method=request.method, route=route_path, status_code=str(response.status_code)
+    ).observe(duration)
+
+    return response
+
+# ────────────────────────────────────────────────────────────────────────────────
+#  Database configuration
+# ────────────────────────────────────────────────────────────────────────────────
+DB_HOST     = os.getenv("DB_HOST", "localhost")
+DB_PORT     = int(os.getenv("DB_PORT", 5432))
+DB_NAME     = os.getenv("DB_NAME", "appdb")
+DB_USER     = os.getenv("DB_USER", "postgres")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "sagor123")
 
-# Create PostgreSQL connection pool on startup
+# ────────────────────────────────────────────────────────────────────────────────
+#  Startup & shutdown
+# ────────────────────────────────────────────────────────────────────────────────
 @app.on_event("startup")
-async def startup():
+async def startup() -> None:
+    # 1) asyncpg connection pool
     try:
         app.state.pool = await asyncpg.create_pool(
-            host=DB_HOST,
-            port=DB_PORT,
-            database=DB_NAME,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            max_size=20,
-            max_inactive_connection_lifetime=30,
-            timeout=2
+            host=DB_HOST, port=DB_PORT, database=DB_NAME,
+            user=DB_USER, password=DB_PASSWORD,
+            max_size=20, max_inactive_connection_lifetime=30, timeout=2,
         )
-        print(f"Successfully connected to database: {DB_NAME}")
+        print(f"Connected to Postgres '{DB_NAME}' on {DB_HOST}:{DB_PORT}")
     except Exception as e:
-        print(f"Warning: Could not connect to database: {e}")
+        print(f"⚠️  Could not connect to Postgres: {e}")
         app.state.pool = None
 
-# Close connection pool on shutdown
+    # 2) background tasks ─ CPU gauge + DB connection gauge
+    loop = asyncio.get_event_loop()
+    loop.create_task(sample_cpu_usage())
+    loop.create_task(sample_db_connections())
+
 @app.on_event("shutdown")
-async def shutdown():
-    if hasattr(app.state, 'pool') and app.state.pool:
+async def shutdown() -> None:
+    if getattr(app.state, "pool", None):
         await app.state.pool.close()
 
-# Health check route
-@app.get("/")
-def root():
-    return {"Hello": "World", "status": "healthy"}
+# ────────────────────────────────────────────────────────────────────────────────
+#  Background tasks for gauges
+# ────────────────────────────────────────────────────────────────────────────────
+async def sample_cpu_usage() -> None:
+    """Set CPU_PERCENT_GAUGE every 5 s using psutil.cpu_percent(None)."""
+    while True:
+        try:
+            CPU_PERCENT_GAUGE.set(psutil.cpu_percent(interval=None))
+        finally:
+            await asyncio.sleep(5)
 
-# Health check with database status
-@app.get("/health", status_code=200)
-async def health_check():
-    start_time = time.time()
+async def sample_db_connections() -> None:
+    """Set DB_CONNECTIONS_ACTIVE every 5 s using asyncpg pool stats."""
+    while True:
+        try:
+            pool = getattr(app.state, "pool", None)
+            if pool:                       # asyncpg >= 0.29 has get_stats()
+                acquired, acquiring, idle, total = pool.get_stats()
+                DB_CONNECTIONS_ACTIVE.set(acquired)
+        finally:
+            await asyncio.sleep(5)
+
+# ────────────────────────────────────────────────────────────────────────────────
+#  Helper: row → dict with ISO dates (used by CRUD endpoints)
+# ────────────────────────────────────────────────────────────────────────────────
+def serialize_row(row):
+    return {
+        k: (v.isoformat() if isinstance(v, datetime) else v)
+        for k, v in dict(row).items()
+    }
+
+# ────────────────────────────────────────────────────────────────────────────────
+#  Health check  (GET /health)
+# ────────────────────────────────────────────────────────────────────────────────
+@app.get("/health", response_model=None)
+async def health_check() -> JSONResponse:
+    ts_start = time.time()
     try:
-        # Ensure DB pool is connected
         if not getattr(app.state, "pool", None):
-            raise Exception("Database not connected")
+            raise RuntimeError("Database not connected")
 
         async with app.state.pool.acquire() as conn:
-            result = await conn.fetchrow("SELECT NOW()")
-            db_time = result["now"].isoformat()
+            db_now_row = await conn.fetchrow("SELECT NOW()")
+            db_time = db_now_row["now"].isoformat()
 
-        # Process memory info (similar to Node.js's process.memoryUsage())
-        process = psutil.Process(os.getpid())
-        memory_info = process.memory_info()._asdict()
+        mem = psutil.Process(os.getpid()).memory_info()._asdict()
 
         return JSONResponse(
             content={
                 "status": "healthy",
                 "timestamp": datetime.utcnow().isoformat(),
                 "database": "connected",
-                "uptime": round(time.time() - start_time, 2),
-                "memory": memory_info,
+                "uptime": round(time.time() - ts_start, 2),
+                "memory": mem,
                 "db_time": db_time,
             }
         )
-
-    except Exception as error:
+    except Exception as e:
         return JSONResponse(
             status_code=503,
             content={
                 "status": "unhealthy",
                 "timestamp": datetime.utcnow().isoformat(),
-                "error": str(error),
-            }
+                "error": str(e),
+            },
         )
 
-
-# Create user endpoint
-@app.post("/user", status_code=status.HTTP_201_CREATED)
-async def create_user(request: Request) -> JSONResponse:
-    start_time = time.time()
+# ────────────────────────────────────────────────────────────────────────────────
+#  CRUD endpoints: /user, /users, /user/{id}          (unchanged logic, new metrics)
+# ────────────────────────────────────────────────────────────────────────────────
+@app.post("/user", status_code=201)
+async def create_user(request: Request):
+    ts = time.time()
     conn = None
-
-    def serialize_row(row):
-        from datetime import datetime
-        return {
-            key: (value.isoformat() if isinstance(value, datetime) else value)
-            for key, value in dict(row).items()
-        }
-
     try:
-        # Check if database is available
-        if not getattr(app.state, 'pool', None):
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Database not available",
-            )
+        if not getattr(app.state, "pool", None):
+            raise HTTPException(503, "Database not available")
 
         body = await request.json()
-        name = body.get("name")
-        email = body.get("email")
-        message = body.get("message", "")
-
+        name, email, message = body.get("name"), body.get("email"), body.get("message", "")
         if not name or not email:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Name and email are required",
-            )
+            raise HTTPException(400, "Name and email are required")
 
         conn = await app.state.pool.acquire()
-
-        query = """
-            INSERT INTO user_data (name, email, message, created_at)
-            VALUES ($1, $2, $3, NOW())
-            RETURNING *
-        """
-        row = await conn.fetchrow(query, name, email, message)
-
-        duration = time.time() - start_time
-        db_query_duration.labels(operation="insert").observe(duration)
-        db_operations_total.labels(operation="insert", status="success").inc()
-
-        return JSONResponse(
-            status_code=status.HTTP_201_CREATED,
-            content={"success": True, "data": serialize_row(row)},
+        row = await conn.fetchrow(
+            "INSERT INTO user_data (name, email, message, created_at) "
+            "VALUES ($1,$2,$3,NOW()) RETURNING *",
+            name, email, message
         )
 
-    except HTTPException as exc:
-        raise exc
-
-    except Exception as exc:
-        duration = time.time() - start_time
-        db_query_duration.labels(operation="insert").observe(duration)
-        db_operations_total.labels(operation="insert", status="error").inc()
-
-        print("Database error:", exc)
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"error": "Failed to insert data", "message": str(exc)},
-        )
-
+        DB_QUERY_DURATION.labels("insert").observe(time.time() - ts)
+        DB_OPERATIONS_TOTAL.labels("insert", "success").inc()
+        return {"success": True, "data": serialize_row(row)}
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        DB_QUERY_DURATION.labels("insert").observe(time.time() - ts)
+        DB_OPERATIONS_TOTAL.labels("insert", "error").inc()
+        raise HTTPException(500, f"Failed to insert data: {e}")
     finally:
         if conn:
             await app.state.pool.release(conn)
 
-# Get all users endpoint
-@app.get("/users", status_code=status.HTTP_200_OK)
+@app.get("/users")
 async def get_users():
-    start_time = time.time()
+    ts = time.time()
     conn = None
-
-    def serialize_row(row):
-        return {
-            key: (value.isoformat() if isinstance(value, datetime) else value)
-            for key, value in dict(row).items()
-        }
-
     try:
-        if not hasattr(app.state, 'pool') or not app.state.pool:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Database not available",
-            )
-
+        if not getattr(app.state, "pool", None):
+            raise HTTPException(503, "Database not available")
         conn = await app.state.pool.acquire()
-
-        query = "SELECT * FROM user_data ORDER BY created_at DESC LIMIT 100"
-        rows = await conn.fetch(query)
-
-        duration = time.time() - start_time
-        db_query_duration.labels(operation="select").observe(duration)
-        db_operations_total.labels(operation="select", status="success").inc()
-
-        return JSONResponse(
-            content={
-                "success": True,
-                "count": len(rows),
-                "data": [serialize_row(row) for row in rows],
-            }
-        )
-
-    except HTTPException as exc:
-        raise exc
-
-    except Exception as error:
-        duration = time.time() - start_time
-        db_query_duration.labels(operation="select").observe(duration)
-        db_operations_total.labels(operation="select", status="error").inc()
-
-        print("Database error:", error)
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={
-                "error": "Failed to retrieve data",
-                "message": str(error),
-            },
-        )
-
+        rows = await conn.fetch("SELECT * FROM user_data ORDER BY created_at DESC LIMIT 100")
+        DB_QUERY_DURATION.labels("select").observe(time.time() - ts)
+        DB_OPERATIONS_TOTAL.labels("select", "success").inc()
+        return {"success": True, "count": len(rows), "data": [serialize_row(r) for r in rows]}
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        DB_QUERY_DURATION.labels("select").observe(time.time() - ts)
+        DB_OPERATIONS_TOTAL.labels("select", "error").inc()
+        raise HTTPException(500, f"Failed to retrieve data: {e}")
     finally:
         if conn:
             await app.state.pool.release(conn)
 
-# ---------------------------------------------------------------------------
-# Update user endpoint (Partial update)
-# ---------------------------------------------------------------------------
-@app.put("/user/{id}", status_code=status.HTTP_200_OK)
-async def update_user(id: int, request: Request) -> JSONResponse:
-    start_time = time.time()
+@app.put("/user/{id}")
+async def update_user(id: int, request: Request):
+    ts = time.time()
     conn = None
-
-    def serialize_row(row):
-        return {
-            key: (value.isoformat() if isinstance(value, datetime) else value)
-            for key, value in dict(row).items()
-        }
+    body = await request.json()
+    if not body:
+        raise HTTPException(400, "No payload provided")
 
     try:
         if not getattr(app.state, "pool", None):
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Database not available",
-            )
-
-        body = await request.json()
-
-        if not body:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="At least one field (name, email, message) is required for update",
-            )
-
+            raise HTTPException(503, "Database not available")
         conn = await app.state.pool.acquire()
 
-        # Fetch existing user to check existence
-        existing = await conn.fetchrow("SELECT * FROM user_data WHERE id = $1", id)
-        if not existing:
-            duration = time.time() - start_time
-            db_query_duration.labels(operation="update").observe(duration)
-            db_operations_total.labels(operation="update", status="error").inc()
-            raise HTTPException(status_code=404, detail="Record not found")
+        # ensure record exists
+        if not await conn.fetchrow("SELECT 1 FROM user_data WHERE id=$1", id):
+            raise HTTPException(404, "Record not found")
 
-        # Build dynamic SET clause
-        allowed_fields = ["name", "email", "message"]
-        set_clauses = []
-        values = []
-        index = 1
-
-        for field in allowed_fields:
+        cols, vals, idx = [], [], 1
+        for field in ("name", "email", "message"):
             if field in body:
-                set_clauses.append(f"{field} = ${index}")
-                values.append(body[field])
-                index += 1
+                cols.append(f"{field} = ${idx}"); vals.append(body[field]); idx += 1
+        if not cols:
+            raise HTTPException(400, "No valid fields provided")
+        cols.append("updated_at = NOW()")
+        vals.append(id)
 
-        if not set_clauses:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No valid fields provided for update",
-            )
-
-        # Add updated_at field
-        set_clauses.append(f"updated_at = NOW()")
-
-        # Final query
-        update_query = f"""
-            UPDATE user_data
-            SET {', '.join(set_clauses)}
-            WHERE id = ${index}
-            RETURNING *
-        """
-        values.append(id)
-
-        updated_row = await conn.fetchrow(update_query, *values)
-
-        duration = time.time() - start_time
-        db_query_duration.labels(operation="update").observe(duration)
-        db_operations_total.labels(operation="update", status="success").inc()
-
-        return JSONResponse(
-            content={"success": True, "data": serialize_row(updated_row)}
+        updated = await conn.fetchrow(
+            f"UPDATE user_data SET {', '.join(cols)} WHERE id = ${idx} RETURNING *", *vals
         )
-
-    except HTTPException as exc:
-        raise exc
-
-    except Exception as exc:
-        duration = time.time() - start_time
-        db_query_duration.labels(operation="update").observe(duration)
-        db_operations_total.labels(operation="update", status="error").inc()
-
-        print("Database error:", exc)
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"error": "Failed to update data", "message": str(exc)},
-        )
-
+        DB_QUERY_DURATION.labels("update").observe(time.time() - ts)
+        DB_OPERATIONS_TOTAL.labels("update", "success").inc()
+        return {"success": True, "data": serialize_row(updated)}
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        DB_QUERY_DURATION.labels("update").observe(time.time() - ts)
+        DB_OPERATIONS_TOTAL.labels("update", "error").inc()
+        raise HTTPException(500, f"Failed to update data: {e}")
     finally:
         if conn:
             await app.state.pool.release(conn)
 
-
-# ---------------------------------------------------------------------------
-# Delete user endpoint
-# ---------------------------------------------------------------------------
-@app.delete("/user/{id}", status_code=status.HTTP_200_OK)
-async def delete_user(id: int) -> JSONResponse:
-    start_time = time.time()
+@app.delete("/user/{id}")
+async def delete_user(id: int):
+    ts = time.time()
     conn = None
-
-    def serialize_row(row):
-        from datetime import datetime
-        return {
-            key: (value.isoformat() if isinstance(value, datetime) else value)
-            for key, value in dict(row).items()
-        }
-
     try:
-        # Verify DB pool availability
         if not getattr(app.state, "pool", None):
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Database not available",
-            )
-
+            raise HTTPException(503, "Database not available")
         conn = await app.state.pool.acquire()
-
-        query = "DELETE FROM user_data WHERE id = $1 RETURNING *"
-        deleted_row = await conn.fetchrow(query, id)
-
-        duration = time.time() - start_time
-        if not deleted_row:
-            db_query_duration.labels(operation="delete").observe(duration)
-            db_operations_total.labels(operation="delete", status="error").inc()
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Record not found",
-            )
-
-        db_query_duration.labels(operation="delete").observe(duration)
-        db_operations_total.labels(operation="delete", status="success").inc()
-
-        return JSONResponse(
-            content={"success": True, "data": serialize_row(deleted_row)}
-        )
-
-    except HTTPException as exc:
-        raise exc
-
-    except Exception as exc:
-        duration = time.time() - start_time
-        db_query_duration.labels(operation="delete").observe(duration)
-        db_operations_total.labels(operation="delete", status="error").inc()
-
-        print("Database error:", exc)
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={
-                "error": "Failed to delete data",
-                "message": str(exc),
-            },
-        )
-
+        deleted = await conn.fetchrow("DELETE FROM user_data WHERE id=$1 RETURNING *", id)
+        if not deleted:
+            raise HTTPException(404, "Record not found")
+        DB_QUERY_DURATION.labels("delete").observe(time.time() - ts)
+        DB_OPERATIONS_TOTAL.labels("delete", "success").inc()
+        return {"success": True, "data": serialize_row(deleted)}
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        DB_QUERY_DURATION.labels("delete").observe(time.time() - ts)
+        DB_OPERATIONS_TOTAL.labels("delete", "error").inc()
+        raise HTTPException(500, f"Failed to delete data: {e}")
     finally:
         if conn:
             await app.state.pool.release(conn)
 
+# ────────────────────────────────────────────────────────────────────────────────
+#  Optional: explicit /custom‑metrics endpoint (if you’d rather keep Instrumentator at /metrics)
+# ────────────────────────────────────────────────────────────────────────────────
+@app.get("/custom-metrics")
+def custom_metrics() -> PlainTextResponse:
+    """Prometheus scrapes here to include our extra gauges/counters."""
+    return PlainTextResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+# ────────────────────────────────────────────────────────────────────────────────
+#  Run via:  uvicorn main:app --host 0.0.0.0 --port 8000
+# ────────────────────────────────────────────────────────────────────────────────
